@@ -183,7 +183,11 @@ def get_statement(company, frequency, messages, balance=False):
             frame = company.get_balance_sheet(freq=frequency, pretty=True)
         else:
             frame = company.get_income_stmt(freq=frequency, pretty=True)
-        return clean_statement(frame)
+        result = clean_statement(frame)
+        if result.empty:
+            kind = "balance sheet" if balance else "income statement"
+            messages.append(f"{frequency} {kind}: empty response.")
+        return result
     except Exception as error:
         kind = "balance sheet" if balance else "income statement"
         messages.append(f"{frequency} {kind}: {error}")
@@ -296,24 +300,184 @@ def is_financial_company(sector, industry):
 # ------------------------------------------------------------
 # 3. Download data and build company defaults
 # ------------------------------------------------------------
-def load_company(ticker):
+
+# Data retrieval is separate from defaults, so metadata edits do not
+# trigger another network download. Only complete downloads are reused.
+def balance_values(frame):
+    if frame.empty:
+        return {}, {}
+    date = frame.columns[0]
+    debt, debt_label = first_row_value(frame, ["Total Debt"], date)
+    if debt is None:
+        short, short_label = first_row_value(
+            frame, ["Current Debt And Capital Lease Obligation", "Current Debt"], date)
+        long, long_label = first_row_value(
+            frame, ["Long Term Debt And Capital Lease Obligation", "Long Term Debt"], date)
+        if short is not None and long is not None:
+            debt, debt_label = short + long, f"{short_label} + {long_label}"
+    cash, cash_label = first_row_value(
+        frame, ["Cash Cash Equivalents And Short Term Investments",
+                "Cash And Cash Equivalents"], date)
+    values = {"totalDebt": debt, "totalCash": cash}
+    sources = {
+        "totalDebt": f"Balance sheet {date.date()}: {debt_label}",
+        "totalCash": f"Balance sheet {date.date()}: {cash_label}",
+    }
+    return values, sources
+
+
+def download_yahoo(ticker):
     company = yf.Ticker(ticker)
     messages = []
-    warnings = []
-
+    sources = {}
     try:
-        info = company.info or {}
+        response = company.get_info()
+        info = dict(response) if isinstance(response, dict) else {}
+        if not info:
+            messages.append("Company information: Yahoo returned an empty response.")
+        for field in info:
+            if info[field] is not None:
+                sources[field] = f"Yahoo company information: {field}"
     except Exception as error:
         info = {}
-        messages.append(f"Company information: {error}")
+        messages.append(f"Company information: {type(error).__name__}: {error}")
+
+    # Quote endpoints may work even when the company-info endpoint fails.
+    quote_fields = {
+        "currentPrice": "last_price",
+        "sharesOutstanding": "shares",
+        "marketCap": "market_cap",
+    }
+    if any(safe_number(info.get(field)) is None for field in quote_fields) or not info.get("currency"):
+        try:
+            fast = company.fast_info
+            for field, fast_field in quote_fields.items():
+                if safe_number(info.get(field)) is None:
+                    try:
+                        value = safe_number(fast[fast_field])
+                        if value is not None and value > 0:
+                            info[field] = value
+                            sources[field] = f"Yahoo fast_info: {fast_field}"
+                    except Exception as error:
+                        messages.append(f"fast_info {fast_field}: {type(error).__name__}: {error}")
+            if not info.get("currency"):
+                try:
+                    value = fast["currency"]
+                    if value:
+                        info["currency"] = str(value)
+                        sources["currency"] = "Yahoo fast_info: quote currency"
+                except Exception as error:
+                    messages.append(f"fast_info currency: {error}")
+        except Exception as error:
+            messages.append(f"Quote fallback: {type(error).__name__}: {error}")
+
+    if safe_number(info.get("currentPrice")) is None:
+        try:
+            history = company.history(period="5d", auto_adjust=False, timeout=15)
+            if not history.empty and "Close" in history:
+                close = pd.to_numeric(history["Close"], errors="coerce").dropna()
+                if not close.empty and close.iloc[-1] > 0:
+                    info["currentPrice"] = float(close.iloc[-1])
+                    sources["currentPrice"] = (
+                        f"Yahoo unadjusted daily close at {close.index[-1]}; not a live quote")
+            if safe_number(info.get("currentPrice")) is None:
+                messages.append("Price history fallback: no valid closing price returned.")
+        except Exception as error:
+            messages.append(f"Price history fallback: {type(error).__name__}: {error}")
+
+    if safe_number(info.get("sharesOutstanding")) is None:
+        try:
+            share_history = company.get_shares_full()
+            if share_history is not None and len(share_history):
+                share_history = pd.to_numeric(share_history, errors="coerce").dropna().sort_index()
+                if len(share_history) and share_history.iloc[-1] > 0:
+                    info["sharesOutstanding"] = float(share_history.iloc[-1])
+                    sources["sharesOutstanding"] = (
+                        f"Yahoo shares history at {share_history.index[-1]}; verify ADR/share basis")
+        except Exception as error:
+            messages.append(f"Shares history fallback: {type(error).__name__}: {error}")
 
     trailing = get_statement(company, "trailing", messages)
     quarterly = get_statement(company, "quarterly", messages)
     annual = get_statement(company, "yearly", messages)
     balance_annual = get_statement(company, "yearly", messages, balance=True)
-    balance_quarterly = get_statement(
-        company, "quarterly", messages, balance=True
-    )
+    balance_quarterly = get_statement(company, "quarterly", messages, balance=True)
+
+    # Recover debt and cash from reported statements, not guessed zeros.
+    balances = sorted(
+        [frame for frame in [balance_quarterly, balance_annual] if not frame.empty],
+        key=lambda frame: frame.columns[0], reverse=True)
+    for frame in balances:
+        values, value_sources = balance_values(frame)
+        for field, value in values.items():
+            if safe_number(info.get(field)) is None and value is not None and value >= 0:
+                info[field] = value
+                sources[field] = value_sources[field]
+
+    # Name/country/sector/currency are never inferred from ticker suffixes.
+    # Trading currency is never copied into financial-statement currency.
+    price = safe_number(info.get("currentPrice"))
+    shares = safe_number(info.get("sharesOutstanding"))
+    if safe_number(info.get("marketCap")) is None and price is not None and shares is not None:
+        info["marketCap"] = price * shares
+        sources["marketCap"] = "Derived: retrieved price times retrieved shares; verify dates/share basis"
+
+    try:
+        estimates = company.revenue_estimate
+        if not isinstance(estimates, pd.DataFrame):
+            estimates = pd.DataFrame()
+        if estimates.empty:
+            messages.append("Analyst revenue estimates: empty response (optional field).")
+    except Exception as error:
+        estimates = pd.DataFrame()
+        messages.append(f"Analyst revenue estimates: {type(error).__name__}: {error}")
+
+    missing = [field for field in [
+        "currentPrice", "sharesOutstanding", "totalDebt", "totalCash",
+        "financialCurrency", "currency", "sector", "country", "beta"
+    ] if info.get(field) is None or info.get(field) == ""]
+    if missing:
+        messages.append("Still missing after fallbacks: " + ", ".join(missing))
+    all_empty = all(frame.empty for frame in [trailing, quarterly, annual])
+    return {
+        "ticker": ticker, "info": info, "sources": sources,
+        "trailing": trailing, "quarterly": quarterly, "annual": annual,
+        "balance_annual": balance_annual, "balance_quarterly": balance_quarterly,
+        "estimates": estimates, "messages": messages,
+        "downloaded_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "complete": not missing and not all_empty,
+    }
+
+
+def obtain_bundle(ticker, refresh=False):
+    cache = st.session_state.setdefault("successful_downloads_v2", {})
+    if not refresh and ticker in cache:
+        cached = cache[ticker]
+        age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(cached["downloaded_at"])
+        if age.total_seconds() < 3600:
+            return cached
+    bundle = download_yahoo(ticker)
+    if bundle["complete"]:
+        cache[ticker] = bundle
+    return bundle
+
+
+def load_company(ticker, metadata=None, bundle=None):
+    if bundle is None:
+        bundle = obtain_bundle(ticker)
+    info = dict(bundle["info"])
+    sources = dict(bundle["sources"])
+    messages = list(bundle["messages"])
+    warnings = []
+    for field, value in (metadata or {}).items():
+        if value:
+            info[field] = value
+            sources[field] = "User-confirmed metadata override"
+    trailing = bundle["trailing"]
+    quarterly = bundle["quarterly"]
+    annual = bundle["annual"]
+    balance_annual = bundle["balance_annual"]
+    balance_quarterly = bundle["balance_quarterly"]
     periods = build_periods(trailing, quarterly, annual)
 
     sector = info.get("sector") or "Not available"
@@ -447,7 +611,7 @@ def load_company(ticker):
     # Analyst revenue estimates are references only.
     analyst_rows = []
     try:
-        estimates = company.revenue_estimate
+        estimates = bundle["estimates"]
         if isinstance(estimates, pd.DataFrame) and not estimates.empty:
             for period_name, estimate in estimates.iterrows():
                 growth_estimate = None
@@ -647,6 +811,10 @@ def load_company(ticker):
         debt_weight_source = "Illustrative 20% fallback: incomplete/currency-mismatched data"
 
     return {
+        "_bundle": bundle,
+        "field_sources": sources,
+        "downloaded_at": bundle["downloaded_at"],
+        "complete_download": bundle["complete"],
         "ticker": ticker,
         "name": info.get("longName") or info.get("shortName") or ticker,
         "currency": quote_currency,
@@ -704,6 +872,9 @@ ticker = st.sidebar.text_input(
 
 if "company_data" not in st.session_state:
     st.session_state.company_data = None
+elif st.session_state.company_data is not None and "_bundle" not in st.session_state.company_data:
+    # Discard an incompatible session object after upgrading this app.
+    st.session_state.company_data = None
 
 if st.sidebar.button("Load data"):
     if not ticker.strip():
@@ -713,13 +884,111 @@ if st.sidebar.button("Load data"):
             with st.spinner("Loading company data..."):
                 loaded = load_company(ticker.strip().upper())
             st.session_state.company_data = loaded
+            st.session_state["using_saved_snapshot"] = False
+            for context_key in list(st.session_state.keys()):
+                if context_key.startswith("context_"):
+                    del st.session_state[context_key]
             reset_defaults()
         except Exception as error:
             st.sidebar.error(f"Could not load company: {error}")
 
+with st.sidebar.expander("Saved Yahoo snapshot (presentation backup)"):
+    st.caption("Only use snapshots you exported from this app. Saved data is not live.")
+    saved_file = st.file_uploader("Upload a saved Yahoo snapshot", type=["json"], key="saved_snapshot_file")
+    if st.button("Use saved snapshot"):
+        if saved_file is None:
+            st.warning("Choose a snapshot file first.")
+        else:
+            try:
+                saved_file.seek(0)
+                records = pd.read_json(saved_file, orient="records", convert_dates=False)
+                if len(records) != 1:
+                    raise ValueError("Expected one snapshot record.")
+                record = records.iloc[0].to_dict()
+                if record.get("snapshot_format") != "dcf-yahoo-v1":
+                    raise ValueError("This is not a snapshot exported by this app.")
+                restored = {
+                    "ticker": str(record["ticker"]),
+                    "info": dict(record["info"]), "sources": dict(record["sources"]),
+                    "messages": list(record["messages"]),
+                    "downloaded_at": str(record["downloaded_at"]),
+                    "complete": bool(record["complete"]),
+                }
+                for field in ["trailing", "quarterly", "annual", "balance_annual", "balance_quarterly"]:
+                    table = record[field]
+                    restored[field] = clean_statement(pd.DataFrame(
+                        table["data"], index=table["index"], columns=table["columns"]))
+                table = record["estimates"]
+                restored["estimates"] = pd.DataFrame(table["data"], index=table["index"], columns=table["columns"])
+                restored["messages"].append("Using a user-uploaded saved snapshot, NOT a live quote.")
+                st.session_state.company_data = load_company(restored["ticker"], bundle=restored)
+                st.session_state["using_saved_snapshot"] = True
+                reset_defaults()
+                for context_key in list(st.session_state.keys()):
+                    if context_key.startswith("context_"):
+                        del st.session_state[context_key]
+            except Exception as error:
+                st.error(f"Snapshot could not be read: {error}")
+
 if st.session_state.company_data is None:
     st.info("Enter a ticker and click Load data.")
     st.stop()
+
+data = st.session_state.company_data
+
+# Metadata affects defaults. Apply edits explicitly without downloading again.
+with st.sidebar.expander("Repair / confirm company details", expanded=not data.get("complete_download", False)):
+    st.caption(
+        "If Yahoo metadata is missing, verify these fields against company reports. "
+        "Do not infer statement currency from the listing exchange.")
+    with st.form("company_metadata_form"):
+        metadata = {}
+        for field, label, default_value in [
+            ("longName", "Company name", data["name"]),
+            ("financialCurrency", "Financial-statement currency, e.g. USD", data["financial_currency"]),
+            ("currency", "Share-price currency/unit, e.g. USD or GBp", data["currency"]),
+            ("country", "Company country, e.g. United States", data["country"]),
+            ("sector", "Sector, e.g. Technology", data["sector"]),
+            ("industry", "Industry (used for suitability warning)", data["industry"]),
+        ]:
+            if default_value == "Not available":
+                default_value = ""
+            metadata[field] = st.text_input(label, value=default_value, key=f"context_{field}").strip()
+        apply_metadata = st.form_submit_button("Apply details and rebuild defaults")
+    st.caption("Applying details resets valuation assumptions to the rebuilt defaults.")
+    if apply_metadata:
+        # Normalize statement ISO codes, but preserve quote units such as GBp.
+        metadata["financialCurrency"] = metadata["financialCurrency"].upper()
+        st.session_state.company_data = load_company(
+            data["ticker"], metadata=metadata, bundle=data["_bundle"])
+        reset_defaults()
+        st.rerun()
+
+if st.sidebar.button("Retry / refresh Yahoo data"):
+    try:
+        with st.spinner("Retrying Yahoo once; existing data is kept if the response is worse..."):
+            refreshed_bundle = obtain_bundle(data["ticker"], refresh=True)
+        def completeness(bundle):
+            fields = ["currentPrice", "sharesOutstanding", "totalDebt", "totalCash",
+                      "financialCurrency", "currency", "sector", "country"]
+            return sum(bundle["info"].get(field) is not None and bundle["info"].get(field) != ""
+                       for field in fields) + sum(not bundle[field].empty for field in
+                       ["annual", "quarterly", "trailing", "balance_annual", "balance_quarterly"])
+        if completeness(refreshed_bundle) < completeness(data["_bundle"]):
+            st.session_state.company_data["messages"].append(
+                "Refresh returned less data; previous download retained. " +
+                " | ".join(refreshed_bundle["messages"]))
+            st.sidebar.warning("Refresh returned less data. Previous download retained.")
+        else:
+            saved_metadata = {field: metadata.get(field, "") for field in metadata
+                              if data.get("field_sources", {}).get(field) == "User-confirmed metadata override"}
+            st.session_state.company_data = load_company(
+                data["ticker"], metadata=saved_metadata, bundle=refreshed_bundle)
+            st.session_state["using_saved_snapshot"] = False
+            reset_defaults()
+            st.rerun()
+    except Exception as error:
+        st.sidebar.error(f"Refresh failed; previous data kept: {type(error).__name__}: {error}")
 
 data = st.session_state.company_data
 defaults = data["defaults"]
@@ -738,6 +1007,29 @@ st.sidebar.button(
 # 5. Snapshot and default diagnostics
 # ------------------------------------------------------------
 st.header(f"Company snapshot: {data['name']} ({data['ticker']})")
+if st.session_state.get("using_saved_snapshot", False):
+    st.warning(f"SAVED DATA MODE: downloaded at {data['downloaded_at']}. Values are not live.")
+
+# Export raw retrieved data only; manual assumptions are not disguised as Yahoo data.
+bundle_export = data["_bundle"]
+snapshot_record = {
+    "snapshot_format": "dcf-yahoo-v1",
+    "ticker": bundle_export["ticker"], "info": bundle_export["info"],
+    "sources": bundle_export["sources"], "messages": bundle_export["messages"],
+    "downloaded_at": bundle_export["downloaded_at"], "complete": bundle_export["complete"],
+}
+for field in ["trailing", "quarterly", "annual", "balance_annual", "balance_quarterly", "estimates"]:
+    frame = bundle_export[field]
+    snapshot_record[field] = {
+        "index": [str(value) for value in frame.index],
+        "columns": [str(value) for value in frame.columns],
+        "data": frame.astype(object).where(pd.notna(frame), None).values.tolist(),
+    }
+st.sidebar.download_button(
+    "Save Yahoo snapshot for backup",
+    data=pd.DataFrame([snapshot_record]).to_json(orient="records", double_precision=15),
+    file_name=f"{data['ticker']}_yahoo_snapshot.json", mime="application/json")
+
 
 if is_financial_company(data["sector"], data["industry"]):
     st.warning(
@@ -804,8 +1096,20 @@ if data["operating_method"] == "EBIT":
     )
 for message in data["warnings"]:
     st.warning(message)
+if not data.get("complete_download", False):
+    st.warning(
+        "Yahoo returned incomplete data. Retrieved values are retained; "
+        "missing values are not invented. Review diagnostics and manual metadata.")
+st.caption(f"Yahoo download time (UTC): {data.get('downloaded_at', 'unknown')}")
+with st.expander("Retrieved field sources"):
+    st.dataframe(pd.DataFrame([
+        {"Field": field, "Source": source}
+        for field, source in data.get("field_sources", {}).items()
+        if field in ["currentPrice", "sharesOutstanding", "totalDebt", "totalCash",
+                     "marketCap", "currency", "financialCurrency", "country", "sector"]
+    ]), hide_index=True, use_container_width=True)
 if data["messages"]:
-    with st.expander("Data retrieval messages"):
+    with st.expander("Data retrieval messages", expanded=not data.get("complete_download", False)):
         for message in data["messages"]:
             st.write(message)
 
@@ -952,6 +1256,9 @@ manual_wacc_percent = number(
 terminal_requested = company_number(
     "Terminal growth rate (%)", "terminal_growth", minimum=-99.0
 )
+if terminal_requested is None or risk_free_percent is None:
+    st.error("Enter both risk-free rate and terminal growth in the sidebar.")
+    st.stop()
 terminal_used_percent = min(terminal_requested, risk_free_percent - 0.5)
 if terminal_used_percent != terminal_requested:
     st.sidebar.warning(
@@ -978,10 +1285,10 @@ def base_number(label, field, source):
 
 
 starting_revenue = base_number("Starting revenue", "revenue", data["revenue_source"])
-total_debt = base_number("Total debt", "debt", "Yahoo totalDebt")
-total_cash = base_number("Cash", "cash", "Yahoo totalCash")
-shares = base_number("Shares outstanding", "shares", "Yahoo sharesOutstanding")
-current_price = base_number("Current share price", "price", "Yahoo currentPrice")
+total_debt = base_number("Total debt", "debt", data["field_sources"].get("totalDebt", "Missing; manual entry required"))
+total_cash = base_number("Cash", "cash", data["field_sources"].get("totalCash", "Missing; manual entry required"))
+shares = base_number("Shares outstanding", "shares", data["field_sources"].get("sharesOutstanding", "Missing; manual entry required"))
+current_price = base_number("Current share price", "price", data["field_sources"].get("currentPrice", "Missing; manual entry required"))
 
 same_currency = (
     bool(financial_currency) and bool(currency)
@@ -1094,7 +1401,22 @@ required = {
     "shares": shares,
     "current price": current_price,
     "currency conversion": fx_factor,
+    "tax rate": tax_percent,
+    "ROIC": roic_percent,
+    "equity risk premium": erp_percent,
+    "beta": beta,
+    "cost of debt": debt_cost_percent,
+    "debt weight": debt_weight_percent,
+    "minority interests": minority,
+    "pension deficit": pension,
+    "lease liabilities": leases,
+    "associates / investments": investments,
 }
+if override_wacc:
+    required["manual WACC"] = manual_wacc_percent
+if not financial_currency or not currency:
+    st.error("Confirm financial-statement currency and share-price currency under Repair / confirm company details.")
+    st.stop()
 if fade_margin:
     required["current operating margin"] = current_margin_percent
 
@@ -1495,6 +1817,9 @@ for container, mode, lower, upper in [
 ]:
     with container:
         st.write(f"Solve for: {mode}")
+        if lower is None or upper is None:
+            st.warning("Enter both search bounds in the sidebar.")
+            continue
         if lower >= upper:
             st.error("Lower search bound must be below upper bound.")
             continue
@@ -1528,6 +1853,9 @@ st.caption(
 # 13. Sensitivity heatmap
 # ------------------------------------------------------------
 st.subheader("Value-per-share sensitivity")
+if wacc_step is None or terminal_step is None:
+    st.warning("Enter both sensitivity step sizes in the sidebar.")
+    st.stop()
 wacc_values = wacc + np.arange(-3, 4) * wacc_step / 100
 terminal_values = terminal_growth + np.arange(-3, 4) * terminal_step / 100
 sensitivity = np.full((7, 7), np.nan)
@@ -1609,4 +1937,7 @@ st.caption(
     "treated as requiring capital. All cash is treated as available to "
     "equity holders. Country is Yahoo's company country, not necessarily "
     "the tax jurisdiction of all earnings. Government yields and statutory "
+    "tax rates are editable assumptions, not verified live data. Yahoo may "
+    "block cloud requests; fallback retrieval cannot guarantee availability. "
+    "Missing financial values require verified manual entry."
 )
